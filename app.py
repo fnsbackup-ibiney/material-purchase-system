@@ -537,7 +537,7 @@ def build_supplier_excel(
     sheet_notes: list,
     cost_col: str | None,
     template_bytes: bytes,
-    order_date: str = "",
+    raw_header_info: dict | None = None,
 ) -> bytes:
     """
     為單一供應商產生一份 Excel 檔(每個款號一張 sheet)。
@@ -571,9 +571,24 @@ def build_supplier_excel(
             ws.title = str(style_code)[:30]
 
         # 1. 替換抬頭區
-        ws[TEMPLATE_HEADER_CELLS["supplier_cell"]] = supplier_name
-        if order_date:
-            ws[TEMPLATE_HEADER_CELLS["date_cell"]] = order_date
+        # 供應商名(C6)— 用 split 後的個別供應商
+        if not isinstance(ws["C6"], MergedCell):
+            ws["C6"] = supplier_name
+
+        # 從 raw 抓的抬頭資訊(訂料日期、收貨人、電話、交貨期、交貨地點)
+        if raw_header_info:
+            mapping = {
+                "order_date":        "K5",
+                "receiver":          "I6",
+                "phone":             "I7",
+                "delivery_date":     "I8",
+                "delivery_location": "I9",
+            }
+            for key, target_cell in mapping.items():
+                if key in raw_header_info:
+                    cell = ws[target_cell]
+                    if not isinstance(cell, MergedCell):
+                        ws[target_cell] = raw_header_info[key]
 
         # 2. 清掉模板範例物料區的值(只清 row 12, 13 — row 15 黃色合計列保留)
         for r in range(TEMPLATE_DATA_START_ROW, TEMPLATE_DATA_START_ROW + TEMPLATE_EXAMPLE_ROWS):
@@ -695,6 +710,27 @@ def build_supplier_excel(
                     end_row=material_end_row,
                 )
 
+        # 7. 合計公式延伸:target row 15 的 `=SUM(L12:L13, 354)` 之類,
+        #    要把 SUM 範圍從 :L13 延伸到 :L<material_end_row>
+        # 範例物料原本最後一行是 row 13(TEMPLATE_DATA_START_ROW + 1),
+        # 找該 row 號在公式中的 :L13 / :M13 等 SUM 範圍引用
+        old_last_row = TEMPLATE_DATA_START_ROW + 1  # 13
+        new_last_row = material_end_row  # 11 + n
+        if new_last_row > old_last_row:
+            # 掃整張 ws 的所有公式 cell,把 :<col><13> 替換成 :<col><material_end>
+            for row in ws.iter_rows():
+                for cell in row:
+                    if isinstance(cell, MergedCell):
+                        continue
+                    if isinstance(cell.value, str) and cell.value.startswith("="):
+                        new_formula = re.sub(
+                            rf":([A-Z]+){old_last_row}(?=[,\)\s])",
+                            rf":\g<1>{new_last_row}",
+                            cell.value,
+                        )
+                        if new_formula != cell.value:
+                            cell.value = new_formula
+
     # 存成 bytes
     out = io.BytesIO()
     wb.save(out)
@@ -718,6 +754,58 @@ def load_template_bytes() -> bytes:
     """讀取打包在 repo 中的 target_format.xlsx 模板"""
     with open(TEMPLATE_PATH, "rb") as f:
         return f.read()
+
+
+def _strip_time_from_date(s: str) -> str:
+    """
+    把『2026-01-30 00:00:00』縮成『2026-01-30』。
+    若 s 沒有時間部分就保留原樣;若不像日期也保留原樣。
+    """
+    if not s:
+        return s
+    s = str(s).strip()
+    # 去掉尾端「空白 + HH:MM 或 HH:MM:SS」
+    s = re.sub(r"\s+\d{1,2}:\d{2}(:\d{2})?(\.\d+)?\s*$", "", s)
+    return s
+
+
+def extract_raw_header_info(df: pd.DataFrame) -> dict:
+    """
+    從 raw ffilled DataFrame 抽出抬頭區資訊,以便寫到 target 對應位置:
+      訂料日期:Row 4 內掃描含「订料日期」的 cell,取右邊一格(位置不固定)
+      收貨人  :I6  (row=5, col=8)
+      電話    :I7  (row=6, col=8)
+      交貨期  :I8  (row=7, col=8)
+      交貨地點:I9  (row=8, col=8)
+    """
+    info: dict = {}
+
+    # 訂料日期:動態搜尋(不同 raw 位置不同 — K5/L5/M5 等)
+    if df.shape[0] > 4:
+        row4 = df.iloc[4]
+        for c in range(df.shape[1] - 1):
+            v = row4.iloc[c]
+            if isinstance(v, str) and "订料日期" in v:
+                nxt = row4.iloc[c + 1]
+                if pd.notna(nxt) and str(nxt).strip():
+                    # 把「2026-01-30 00:00:00」縮成「2026-01-30」
+                    info["order_date"] = _strip_time_from_date(str(nxt).strip())
+                    break
+
+    # 抬頭區其他資訊(位置在 raw / target 間一致:I6, I7, I8, I9)
+    fixed_cells = [
+        ("receiver", 5, 8),         # I6 收貨人
+        ("phone", 6, 8),            # I7 電話
+        ("delivery_date", 7, 8),    # I8 交貨期
+        ("delivery_location", 8, 8),# I9 交貨地點
+    ]
+    for key, r, c in fixed_cells:
+        if df.shape[0] > r and df.shape[1] > c:
+            v = df.iat[r, c]
+            if pd.notna(v) and str(v).strip():
+                info[key] = str(v).strip()
+
+    return info
 
 
 def _merge_same_value_runs(ws, col_idx: int, start_row: int, end_row: int):
@@ -944,12 +1032,16 @@ for file in uploaded_files:
             )
 
             # ── Step 5:把這份資料累積到 export_collector ──
+            # 先抓本 sheet 的抬頭資訊(訂料日期/收貨人/電話/...)
+            this_sheet_header = extract_raw_header_info(df)
+
             for supplier, styles in split_result.items():
                 if supplier not in export_collector:
                     export_collector[supplier] = {
                         "styles": {},
                         "notes": [],
                         "cost_col": cost_col,
+                        "raw_header_info": this_sheet_header,  # 第一次出現該供應商時留存
                     }
                 # 同款號累積資料(若已存在則合併)
                 for style_code, sdf in styles.items():
@@ -1110,6 +1202,7 @@ if export_collector:
                         sheet_notes=info["notes"],
                         cost_col=info["cost_col"],
                         template_bytes=template_bytes,
+                        raw_header_info=info.get("raw_header_info"),
                     )
                     safe_name = re.sub(r'[\\/:*?"<>|]', "_", sup_name)
                     supplier_files[f"採購單_{safe_name}.xlsx"] = excel_bytes
