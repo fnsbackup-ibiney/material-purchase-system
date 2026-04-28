@@ -575,6 +575,10 @@ _RAW_TO_TARGET_MAP = {
 # 排除清單:這些 raw 欄名直接跳過,不寫入 target
 _RAW_SKIP_COLS = {"单价", "金额"}
 
+# 強制覆蓋清單:即使 target 是公式格,也要用 raw 真實值蓋掉
+# 例:訂料數量 — raw 用 1.01 倍,target 用 1.02,以 raw 為準
+_FORCE_OVERWRITE_KEYWORDS = ["总订料数", "订料数量"]
+
 
 def _normalize_col_name(s):
     """把欄名正規化:去空白、繁簡統一(粗略,只去常見全形空白)"""
@@ -752,8 +756,20 @@ def build_supplier_excel(
                     cell = ws.cell(row=target_row, column=target_col_idx)
                     if isinstance(cell, MergedCell):
                         continue
+                    # 檢查該 target 欄名是否在「強制覆蓋」清單(例:訂料數量)
+                    target_header = ws.cell(
+                        row=TEMPLATE_DATA_HEADER_ROW, column=target_col_idx
+                    ).value
+                    target_header_norm = (
+                        _normalize_col_name(target_header) if target_header else ""
+                    )
+                    is_force = any(
+                        kw in target_header_norm for kw in _FORCE_OVERWRITE_KEYWORDS
+                    )
+                    # 公式格保留,但 force_overwrite 清單例外
                     if isinstance(cell.value, str) and cell.value.startswith("="):
-                        continue
+                        if not is_force:
+                            continue
                     cell.value = val
 
         # 6. 縱向合併:同款的款號/品名/客戶編號連續相同 → 合併成一格(模仿 target 設計)
