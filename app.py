@@ -21,6 +21,58 @@ st.set_page_config(
 )
 
 
+# ── Step 6:密碼登入閘門 ─────────────────────────────────
+def _check_password() -> bool:
+    """
+    密碼閘門。已登入 → 回 True;否則顯示登入框並回 False。
+    密碼設定:Streamlit Cloud → App settings → Secrets,加一行 app_password = "xxx"
+    """
+    # 已通過驗證
+    if st.session_state.get("password_correct"):
+        return True
+
+    # 從 secrets 讀預期密碼(雲端)
+    try:
+        expected = st.secrets.get("app_password", "")
+    except Exception:
+        expected = ""
+
+    # 沒設密碼 → 顯示提醒(這時系統還是不允許進入)
+    if not expected:
+        st.error(
+            "🔒 系統未設定密碼\n\n"
+            "請管理員至 Streamlit Cloud → 此 App 的 **Settings → Secrets**,"
+            "新增一行:\n```\napp_password = \"你的密碼\"\n```"
+        )
+        return False
+
+    # 登入畫面
+    st.markdown("# 🔐 系統登入")
+    st.caption("服裝物料採購單自動化處理系統 — 內部使用")
+    pwd = st.text_input(
+        "請輸入密碼",
+        type="password",
+        key="login_pwd_input",
+        placeholder="請輸入內部共用密碼",
+    )
+    col1, _ = st.columns([1, 3])
+    with col1:
+        login = st.button("🔓 登入", type="primary", use_container_width=True)
+
+    if login:
+        if pwd == expected:
+            st.session_state["password_correct"] = True
+            st.rerun()
+        else:
+            st.error("❌ 密碼錯誤,請再試一次")
+    return False
+
+
+# 在所有主畫面內容之前先攔截
+if not _check_password():
+    st.stop()
+
+
 # ── Session state 初始化 ─────────────────────────────────
 # upload_history:累積這次 session 所有上傳過的檔名(關閉瀏覽器才清)
 # uploaded_blobs:對應的檔案二進位內容,讓 sidebar 可以提供下載
@@ -562,6 +614,12 @@ def build_supplier_excel(
     # 對每個款號:複製模板 sheet 並重新命名
     first = True
     for style_code, style_df in styles_dict.items():
+        # ── 同款內「備註欄」自動繼承(ffill 限定該款 sub_df,不跨款)──
+        # raw 同款多筆物料常只寫第一行備註,其他留空 → 程式視為「整款共用」
+        style_df = style_df.copy()
+        for col in style_df.columns:
+            if isinstance(col, str) and ("备注" in col or "備註" in col):
+                style_df[col] = style_df[col].ffill()
         if first:
             ws = template_ws
             ws.title = str(style_code)[:30]  # Excel sheet 名上限 31 字
