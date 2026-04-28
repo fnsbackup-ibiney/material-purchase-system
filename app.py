@@ -770,11 +770,17 @@ def build_supplier_excel(
                     if isinstance(cell.value, str) and cell.value.startswith("="):
                         if not is_force:
                             continue
+                    # 「總訂料數」四捨五入到整數(不要顯示小數點)
+                    if is_force:
+                        try:
+                            val = int(round(float(val)))
+                        except (ValueError, TypeError):
+                            pass  # 不是數字就保留原字串
                     cell.value = val
 
-        # 6. 縱向合併:同款的款號/品名/客戶編號連續相同 → 合併成一格(模仿 target 設計)
+        # 6. 縱向合併:同款的款號/品名/客戶編號/顏色 連續相同 → 合併成一格(模仿 target 設計)
         material_end_row = TEMPLATE_DATA_START_ROW + len(style_df) - 1
-        for col_keyword in ["款号", "品名", "客户编号"]:
+        for col_keyword in ["款号", "品名", "客户编号", "颜色"]:
             if col_keyword in target_headers:
                 _merge_same_value_runs(
                     ws,
