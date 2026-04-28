@@ -3,6 +3,11 @@
 # Step 1: 檔案上傳 + 合併儲存格(向下填充)+ 表格預覽
 # Step 2: 雙層拆分(供應商 → 款號)+ 上傳記錄 sidebar + 清空按鈕
 # Step 3: 真款號 vs 備註分類 + 智慧取價(優先序:成本价 > 大货价 > 单价 > 报价)
+# Step 4A: 標準材料庫上傳 + 三階紅燈比對(🟢已驗證 / 🟡規格不同 / 🚨全新料)
+
+import io
+import re
+import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -26,6 +31,11 @@ if "uploaded_blobs" not in st.session_state:
     st.session_state.uploaded_blobs = {}
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
+# Step 4A:標準庫資料(只存解析後的清單,不存原始 bytes)
+if "std_library" not in st.session_state:
+    st.session_state.std_library = None  # 解析後的 dict
+if "std_library_filename" not in st.session_state:
+    st.session_state.std_library_filename = None
 
 
 # ── 左側 sidebar:本次上傳記錄 + 清空按鈕 ─────────────────
@@ -54,8 +64,38 @@ with st.sidebar:
 
     st.divider()
 
+    # ── Step 4A:標準材料庫上傳區 ────────────────
+    st.subheader("📚 標準材料庫")
+    if st.session_state.std_library:
+        st.success(f"✅ 已載入:{st.session_state.std_library_filename}")
+        n_names = len(st.session_state.std_library["name_set"])
+        st.caption(f"共 {n_names} 筆標準品名")
+        if st.button("🗑️ 移除標準庫", use_container_width=True):
+            st.session_state.std_library = None
+            st.session_state.std_library_filename = None
+            st.rerun()
+    else:
+        std_file = st.file_uploader(
+            "上傳標準材料庫(供比對用)",
+            type=["xlsx"],
+            accept_multiple_files=False,
+            help="不上傳也能用,但無法做紅燈警告",
+            key="std_lib_uploader",
+        )
+        if std_file is not None:
+            try:
+                with st.spinner("解析標準庫中..."):
+                    st.session_state.std_library = parse_standard_library(std_file.getvalue())
+                    st.session_state.std_library_filename = std_file.name
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ 無法解析:{e}")
+
+    st.divider()
+
     # 「清空」只清掉目前選著的檔案,讓你可以上傳下一批
     # 上傳記錄(歷史檔名)會繼續累積,直到你關閉/重新整理瀏覽器
+    # 標準庫也保留,不被清空
     if st.button("🔄 清空,重新開始", type="primary", use_container_width=True):
         st.session_state.uploader_key += 1
         st.rerun()
@@ -246,6 +286,204 @@ def find_cost_column(columns) -> str | None:
     return None
 
 
+# ── Step 4A:標準材料庫讀取 + 三階紅燈比對 ─────────────────
+
+# 標準庫每張 sheet 的設定:表頭行(0-indexed)、品名/料號欄、規格欄、跳過旗標
+# 可比對的欄位 → key 值用標準化字串
+_STD_SHEET_CONFIG = {
+    "3F-Brax Zippers": {"header_row": 1, "name_keys": ["品名", "款号"], "size_keys": ["规格", "尺码"]},
+    "Metal Trims":     {"header_row": 0, "name_keys": ["Article No.品名", "品名"], "size_keys": ["Size尺寸", "Size"]},
+    "Rivet":           {"header_row": 1, "name_keys": ["Item", "FS article number"], "size_keys": []},
+    "Non Metal Trims": {"header_row": 0, "name_keys": ["Article No.品名", "品名"], "size_keys": ["Size尺寸", "Size"]},
+    "Label":           {"header_row": 0, "name_keys": ["Article No.", "品名"], "size_keys": ["Size", "尺寸"]},
+    "Tape":            {"header_row": 0, "name_keys": ["Article No.品名", "品名"], "size_keys": ["Size尺寸", "Size"]},
+    "Paper Tags":      {"skip": True},  # 設計圖,無結構化資料
+}
+
+
+def _strip_styles_xlsx(file_bytes: bytes) -> bytes:
+    """
+    繞過 openpyxl 3.1.5 對某些 .xlsx 的 styles.xml 解析 crash 問題。
+    把 styles.xml 換成最小骨架後重新打包。資料完整保留,只丟掉樣式。
+    """
+    src = io.BytesIO(file_bytes)
+    dst = io.BytesIO()
+    minimal_styles = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b'<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
+        b'<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+        b'<borders count="1"><border/></borders>'
+        b'<cellStyleXfs count="1"><xf/></cellStyleXfs>'
+        b'<cellXfs count="1"><xf/></cellXfs>'
+        b'</styleSheet>'
+    )
+    with zipfile.ZipFile(src, "r") as zin:
+        with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.namelist():
+                data = zin.read(item)
+                if item == "xl/styles.xml":
+                    data = minimal_styles
+                zout.writestr(item, data)
+    return dst.getvalue()
+
+
+def normalize_for_compare(s) -> str:
+    """字串正規化(供比對用):去全部空白、轉大寫、去除常見單位寫法差異。"""
+    if s is None or pd.isna(s):
+        return ""
+    text = str(s).upper()
+    # 去掉所有空白(含全形空白)
+    text = re.sub(r"\s+", "", text)
+    # 統一全形→半形數字/標點
+    text = text.replace(",", ",").replace(":", ":")
+    return text
+
+
+def parse_standard_library(file_bytes: bytes) -> dict:
+    """
+    解析使用者上傳的標準庫 .xlsx,回傳:
+    {
+        'name_set': set[str],         # 所有「品名」正規化字串集合
+        'name_size_set': set[tuple],  # (品名正規化, 規格正規化) 二元組集合
+        'sheets_info': dict           # 每張 sheet 的統計
+    }
+    """
+    safe_bytes = _strip_styles_xlsx(file_bytes)
+    xls = pd.ExcelFile(io.BytesIO(safe_bytes), engine="openpyxl")
+
+    name_set: set[str] = set()
+    name_size_set: set[tuple] = set()
+    sheets_info: dict = {}
+
+    for sheet_name in xls.sheet_names:
+        cfg = _STD_SHEET_CONFIG.get(sheet_name)
+        if cfg is None:
+            sheets_info[sheet_name] = {"status": "未知 sheet,已跳過", "count": 0}
+            continue
+        if cfg.get("skip"):
+            sheets_info[sheet_name] = {"status": "跳過(無結構化資料)", "count": 0}
+            continue
+
+        df = pd.read_excel(xls, sheet_name=sheet_name, header=cfg["header_row"], dtype=str)
+
+        # 找品名欄(用 name_keys 列表逐一嘗試,取第一個符合的)
+        name_col = None
+        for key in cfg["name_keys"]:
+            for col in df.columns:
+                if isinstance(col, str) and key in col:
+                    name_col = col
+                    break
+            if name_col:
+                break
+
+        # 找規格欄
+        size_col = None
+        for key in cfg.get("size_keys", []):
+            for col in df.columns:
+                if isinstance(col, str) and key in col:
+                    size_col = col
+                    break
+            if size_col:
+                break
+
+        if name_col is None:
+            sheets_info[sheet_name] = {"status": "找不到品名欄,跳過", "count": 0}
+            continue
+
+        count = 0
+        for _, row in df.iterrows():
+            raw_name = row.get(name_col)
+            n = normalize_for_compare(raw_name)
+            if not n:
+                continue
+            name_set.add(n)
+            if size_col:
+                s = normalize_for_compare(row.get(size_col))
+                if s:
+                    name_size_set.add((n, s))
+                else:
+                    name_size_set.add((n, ""))
+            else:
+                name_size_set.add((n, ""))
+            count += 1
+
+        sheets_info[sheet_name] = {
+            "status": f"✅ 已讀取(品名欄:{name_col} / 規格欄:{size_col or '無'})",
+            "count": count,
+        }
+
+    return {
+        "name_set": name_set,
+        "name_size_set": name_size_set,
+        "sheets_info": sheets_info,
+    }
+
+
+def _match_one(query: str, library: dict, size_query: str) -> str:
+    """
+    單一 key 的三階比對。回傳 🟢 / 🟡 / 🚨。
+    寬鬆比對:正規化後雙向「包含」即視為命中。
+    """
+    if not query:
+        return "🚨"
+    matched_names = set()
+    for n_lib in library["name_set"]:
+        if not n_lib:
+            continue
+        if query in n_lib or n_lib in query:
+            matched_names.add(n_lib)
+
+    if not matched_names:
+        return "🚨"
+
+    for n_lib in matched_names:
+        sizes = {s for (nm, s) in library["name_size_set"] if nm == n_lib}
+        if "" in sizes:
+            return "🟢"
+        if not size_query:
+            return "🟡"
+        for s_lib in sizes:
+            if size_query in s_lib or s_lib in size_query:
+                return "🟢"
+    return "🟡"
+
+
+# 三階優先序:🟢 最好 → 🟡 → 🚨 最差
+_RANK = {"🟢": 0, "🟡": 1, "🚨": 2, "⚪": 3}
+
+
+def compare_with_library(name, code, size, library: dict) -> str:
+    """
+    雙 key 比對:品名 OR 客戶編號 任一命中即算找到。
+    取兩個 key 比對結果中「最好」的那一個。
+
+    🟢 任一命中 + 規格相符
+    🟡 任一命中但規格不同
+    🚨 兩個都找不到
+    ⚪ 沒上傳標準庫 / 兩個都是空字串
+    """
+    if not library:
+        return "⚪"
+
+    n_query = normalize_for_compare(name)
+    c_query = normalize_for_compare(code)
+    s_query = normalize_for_compare(size)
+
+    if not n_query and not c_query:
+        return "⚪"
+
+    results = []
+    if n_query:
+        results.append(_match_one(n_query, library, s_query))
+    if c_query:
+        results.append(_match_one(c_query, library, s_query))
+
+    # 取最好的結果(rank 最小)
+    best = min(results, key=lambda r: _RANK.get(r, 9))
+    return best
+
+
 def split_by_supplier_and_style(data_df: pd.DataFrame, header_info: dict) -> dict:
     """
     雙層拆分:先按供應商,再按款號。
@@ -390,9 +628,46 @@ for file in uploaded_files:
                 with stab:
                     # 第二層:每個款號一個 expander
                     for style, sdf in styles.items():
+                        # ── Step 4A:逐筆物料做紅燈比對 ──
+                        # 找此筆款的「品名」「客戶編號」「規格」欄
+                        name_col_for_compare = next(
+                            (c for c in sdf.columns if isinstance(c, str) and "品名" in c),
+                            None,
+                        )
+                        code_col_for_compare = next(
+                            (c for c in sdf.columns
+                             if isinstance(c, str) and ("客户编号" in c or "客戶編號" in c or "Article" in c)),
+                            None,
+                        )
+                        size_col_for_compare = next(
+                            (c for c in sdf.columns
+                             if isinstance(c, str) and ("规格" in c or "尺码" in c or "尺寸" in c)),
+                            None,
+                        )
+                        # 算出比對狀態 — 雙 key 比對:品名 OR 客戶編號任一命中即綠
+                        statuses = []
+                        if name_col_for_compare or code_col_for_compare:
+                            for _, mat_row in sdf.iterrows():
+                                name = mat_row.get(name_col_for_compare) if name_col_for_compare else None
+                                code = mat_row.get(code_col_for_compare) if code_col_for_compare else None
+                                size = mat_row.get(size_col_for_compare) if size_col_for_compare else None
+                                statuses.append(
+                                    compare_with_library(name, code, size, st.session_state.std_library)
+                                )
+                        else:
+                            statuses = ["⚪"] * len(sdf)
+
+                        # 統計
+                        n_green = statuses.count("🟢")
+                        n_yellow = statuses.count("🟡")
+                        n_red = statuses.count("🚨")
+                        n_white = statuses.count("⚪")
+                        # 款號標題若有紅燈,加警告 emoji
+                        title_warn = " 🚨" if n_red > 0 else (" 🟡" if n_yellow > 0 else "")
+
                         with st.expander(
-                            f"🏷️ 款號:{style}  ({len(sdf)} 筆物料)",
-                            expanded=False,
+                            f"🏷️ 款號:{style}  ({len(sdf)} 筆物料){title_warn}",
+                            expanded=(n_red > 0),  # 有紅燈自動展開
                         ):
                             # 顯示這筆款號套用了哪些備註(目前是 sheet 級)
                             if sheet_notes:
@@ -405,9 +680,22 @@ for file in uploaded_files:
                                         f"💰 此款成本價(欄「{cost_col}」):"
                                         f"{', '.join(map(str, cost_values[:5]))}"
                                     )
+                            # 比對統計
+                            if st.session_state.std_library:
+                                st.caption(
+                                    f"🚦 比對結果: 🟢 {n_green} 筆 / 🟡 {n_yellow} 筆 / "
+                                    f"🚨 {n_red} 筆 / ⚪ {n_white} 筆未比對"
+                                )
+                            else:
+                                st.caption("⚪ 尚未上傳標準庫,無法比對(👈 在左側 sidebar 上傳)")
+
+                            # 加上「比對狀態」欄到表格(放第一欄)
+                            sdf_display = sdf.copy()
+                            sdf_display.insert(0, "🚦", statuses)
+
                             st.dataframe(
-                                sdf,
+                                sdf_display,
                                 use_container_width=True,
                                 hide_index=True,
-                                height=200,
+                                height=220,
                             )
