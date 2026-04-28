@@ -2,6 +2,7 @@
 # 服裝物料採購單自動化處理系統
 # Step 1: 檔案上傳 + 合併儲存格(向下填充)+ 表格預覽
 # Step 2: 雙層拆分(供應商 → 款號)+ 上傳記錄 sidebar + 清空按鈕
+# Step 3: 真款號 vs 備註分類 + 智慧取價(優先序:成本价 > 大货价 > 单价 > 报价)
 
 import pandas as pd
 import streamlit as st
@@ -169,6 +170,82 @@ def parse_sheet(df: pd.DataFrame, sheet_name: str) -> tuple[pd.DataFrame, dict]:
     return data_df, {"default_supplier": default_supplier, "sheet_name": sheet_name}
 
 
+# ── Step 3 核心:真款號判別 + 備註分類 + 智慧取價 ─────────
+
+# 黑名單(明顯不是款號的字串)
+_FAKE_CODE_BLACKLIST = {"TOTAL", "注:", "注:", "備註:", "备注:", "—", "-"}
+
+
+def is_real_style_code(value) -> bool:
+    """
+    判斷一個 cell 是否為「真款號」。
+    真款號:短(< 20 字)、含數字、不在黑名單、不是「1./2./3.」這種編號條款。
+    """
+    if value is None or pd.isna(value):
+        return False
+    s = str(value).strip()
+    if not s:
+        return False
+    if s.upper() in {x.upper() for x in _FAKE_CODE_BLACKLIST}:
+        return False
+    # 長度太長 → 多半是中文備註句
+    if len(s) > 20:
+        return False
+    # 沒有任何數字 → 多半是標籤,不是編號
+    if not any(c.isdigit() for c in s):
+        return False
+    # 開頭是「1.」「2、」這種編號條款
+    if len(s) >= 2 and s[0].isdigit() and s[1] in ".．、 ":
+        return False
+    return True
+
+
+def classify_data_rows(
+    data_df: pd.DataFrame, style_col: str
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    分離資料行為「真款號物料」與「備註行」。
+    真款號 → real_df
+    其他 → 取 style_col 的字串當作備註,集中為一個 list(去重保序)
+    """
+    if data_df.empty or style_col not in data_df.columns:
+        return data_df.copy(), []
+
+    real_mask = data_df[style_col].apply(is_real_style_code)
+    real_df = data_df[real_mask].copy().reset_index(drop=True)
+    notes_df = data_df[~real_mask]
+
+    notes: list[str] = []
+    seen: set[str] = set()
+    for _, row in notes_df.iterrows():
+        text = row[style_col]
+        if text is None or pd.isna(text):
+            continue
+        text = str(text).strip()
+        # 過濾無意義小標題、合計列
+        if not text or text.upper() == "TOTAL" or text in {"注:", "注:"}:
+            continue
+        if text not in seen:
+            seen.add(text)
+            notes.append(text)
+
+    return real_df, notes
+
+
+# 智慧取價:依優先序找出「成本價」欄
+# 順序:成本价 > 供应商成本价 > 大货价 > 单价 > 报价
+_PRICE_PRIORITY = ["成本价", "供应商成本价", "大货价", "单价", "报价"]
+
+
+def find_cost_column(columns) -> str | None:
+    """從欄位名稱中找出最優先的價格欄;找不到回 None"""
+    for keyword in _PRICE_PRIORITY:
+        for col in columns:
+            if isinstance(col, str) and keyword in col:
+                return col
+    return None
+
+
 def split_by_supplier_and_style(data_df: pd.DataFrame, header_info: dict) -> dict:
     """
     雙層拆分:先按供應商,再按款號。
@@ -254,7 +331,7 @@ for file in uploaded_files:
             st.markdown("##### 1️⃣ 原始預覽(ffill 後)")
             st.dataframe(df, use_container_width=True, hide_index=True, height=250)
 
-            # ② 雙層拆分結果
+            # ② 雙層拆分結果(Step 3 強化:識別假款號為備註 + 智慧取價)
             st.markdown("##### 2️⃣ 雙層拆分(供應商 → 款號)")
 
             data_df, header_info = parse_sheet(df, sheet_name)
@@ -265,18 +342,46 @@ for file in uploaded_files:
                 )
                 continue
 
-            split_result = split_by_supplier_and_style(data_df, header_info)
+            # 找款號欄(在 split 之前先找出來,以便分類)
+            style_col_for_class = next(
+                (c for c in data_df.columns if isinstance(c, str) and "款号" in c),
+                None,
+            )
+            if style_col_for_class is None:
+                st.warning("⚠️ 找不到「款号」欄,無法處理")
+                continue
+
+            # ── Step 3:分離真款號物料 vs 備註 ──
+            real_df, sheet_notes = classify_data_rows(data_df, style_col_for_class)
+
+            # ── Step 3:智慧取價 ──
+            cost_col = find_cost_column(real_df.columns)
+
+            # 顯示 sheet 級的備註(出口規定、條款等)
+            if sheet_notes:
+                with st.container(border=True):
+                    st.markdown(f"📌 **此 sheet 共 {len(sheet_notes)} 條備註**(會套用到此 sheet 所有款號)")
+                    for note in sheet_notes:
+                        st.markdown(f"- {note}")
+
+            # 顯示成本價欄判斷結果
+            if cost_col:
+                st.success(f"💰 自動抓到成本價欄:**{cost_col}**(優先序:成本价 > 大货价 > 单价 > 报价)")
+            else:
+                st.info("💰 未找到成本價相關欄位")
+
+            # 用真款號 df 做拆分
+            split_result = split_by_supplier_and_style(real_df, header_info)
 
             if not split_result:
-                st.warning(
-                    "⚠️ 找不到「款号」欄,無法拆分。請確認第 10 行有「款号」標題"
-                )
+                st.warning("⚠️ 過濾掉假款號後,沒有任何真款號可拆分")
                 continue
 
             n_suppliers = len(split_result)
             n_styles = sum(len(v) for v in split_result.values())
             st.caption(
-                f"📊 拆出 **{n_suppliers}** 個供應商,共 **{n_styles}** 個款號"
+                f"📊 拆出 **{n_suppliers}** 個供應商,共 **{n_styles}** 個真款號"
+                f"(已過濾 {len(sheet_notes)} 條備註)"
             )
 
             # 第一層 tabs:供應商
@@ -289,6 +394,17 @@ for file in uploaded_files:
                             f"🏷️ 款號:{style}  ({len(sdf)} 筆物料)",
                             expanded=False,
                         ):
+                            # 顯示這筆款號套用了哪些備註(目前是 sheet 級)
+                            if sheet_notes:
+                                st.caption(f"📌 套用備註({len(sheet_notes)} 條)")
+                            # 顯示成本價欄(若有)
+                            if cost_col and cost_col in sdf.columns:
+                                cost_values = sdf[cost_col].dropna().unique().tolist()
+                                if cost_values:
+                                    st.caption(
+                                        f"💰 此款成本價(欄「{cost_col}」):"
+                                        f"{', '.join(map(str, cost_values[:5]))}"
+                                    )
                             st.dataframe(
                                 sdf,
                                 use_container_width=True,
