@@ -1,0 +1,17 @@
+# 樣本資料、實際業務檔案 — 絕不上傳
+samples/
+*.xlsx
+*.xls
+*.csv
+
+# Python 虛擬環境與快取
+.venv/
+__pycache__/
+*.pyc
+
+# Mac 系統垃圾檔
+.DS_Store
+
+# 編輯器設定
+.vscode/
+.idea/
