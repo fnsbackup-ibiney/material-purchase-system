@@ -684,6 +684,17 @@ def build_supplier_excel(
                         continue
                     cell.value = val
 
+        # 6. 縱向合併:同款的款號/品名/客戶編號連續相同 → 合併成一格(模仿 target 設計)
+        material_end_row = TEMPLATE_DATA_START_ROW + len(style_df) - 1
+        for col_keyword in ["款号", "品名", "客户编号"]:
+            if col_keyword in target_headers:
+                _merge_same_value_runs(
+                    ws,
+                    col_idx=target_headers[col_keyword],
+                    start_row=TEMPLATE_DATA_START_ROW,
+                    end_row=material_end_row,
+                )
+
     # 存成 bytes
     out = io.BytesIO()
     wb.save(out)
@@ -707,6 +718,54 @@ def load_template_bytes() -> bytes:
     """讀取打包在 repo 中的 target_format.xlsx 模板"""
     with open(TEMPLATE_PATH, "rb") as f:
         return f.read()
+
+
+def _merge_same_value_runs(ws, col_idx: int, start_row: int, end_row: int):
+    """
+    在 ws 的 col_idx 欄的 start_row~end_row 範圍內,把連續相同值的儲存格合併。
+    例:款號全部都是 80201 → 整欄合併成一個大儲存格,跟 target 模板「同款縱向合併」效果一樣。
+    """
+    from openpyxl.cell.cell import MergedCell as _MC
+    from openpyxl.utils import get_column_letter as _gcl
+
+    if end_row <= start_row:
+        return
+    col_letter = _gcl(col_idx)
+
+    # 1. 取出該欄每一行的「實際值」(MergedCell 用上面合併的值代替)
+    values = []
+    for r in range(start_row, end_row + 1):
+        cell = ws.cell(row=r, column=col_idx)
+        if isinstance(cell, _MC):
+            values.append(values[-1] if values else None)
+        else:
+            values.append(cell.value)
+
+    # 2. 先取消該欄範圍內既有的合併,避免衝突
+    for m in list(ws.merged_cells.ranges):
+        if m.min_col == col_idx and m.max_col == col_idx \
+                and m.min_row >= start_row and m.max_row <= end_row:
+            ws.unmerge_cells(str(m))
+
+    # 3. 找出「連續相同值」的 runs,一次寫一個合併
+    i = 0
+    while i < len(values):
+        j = i
+        while (
+            j + 1 < len(values)
+            and values[j + 1] == values[i]
+            and values[i] is not None
+        ):
+            j += 1
+        if j > i:
+            r1, r2 = start_row + i, start_row + j
+            ws.merge_cells(f"{col_letter}{r1}:{col_letter}{r2}")
+            # 確保只第一格有值,其他清空(以免合併後顯示問題)
+            for r in range(r1 + 1, r2 + 1):
+                cell = ws.cell(row=r, column=col_idx)
+                if not isinstance(cell, _MC):
+                    cell.value = None
+        i = j + 1
 
 
 def compare_with_library(name, code, size, library: dict) -> str:
