@@ -136,21 +136,42 @@ if not uploaded_files:
     st.stop()
 
 
-# ── 讀檔函式(同 Step 1)─────────────────────────────────
+# ── 讀檔函式(同 Step 1,Step 5 修正:備註欄不 ffill)──────
+# 這些欄位**不應該** ffill — 它們的空白是「真實沒值」,不是合併儲存格留白
+# 否則上一筆物料的備註會被錯誤地灌到下一筆物料上
+_NO_FFILL_COL_KEYWORDS = ["备注", "備註", "報價備註", "报价备注", "remark", "Remark", "REMARK"]
+
+
+def _ffill_with_exceptions(df: pd.DataFrame, header_row_idx: int = 10) -> pd.DataFrame:
+    """
+    對 df 做 ffill,但把指定關鍵字的欄位排除(不 ffill)。
+    header_row_idx:用第幾行(0-indexed)當欄名來判斷該欄是不是要排除。
+    """
+    df_filled = df.ffill(axis=0)
+    if df.shape[0] <= header_row_idx:
+        return df_filled
+    headers = df.iloc[header_row_idx]
+    for col_idx, header in enumerate(headers):
+        if isinstance(header, str) and any(kw in header for kw in _NO_FFILL_COL_KEYWORDS):
+            # 該欄不 ffill,還原為原始 NaN 狀態
+            df_filled.iloc[:, col_idx] = df.iloc[:, col_idx]
+    return df_filled
+
+
 def read_file(file) -> dict:
-    """讀取上傳檔,回傳 {sheet_name: DataFrame}(已 ffill)。"""
+    """讀取上傳檔,回傳 {sheet_name: DataFrame}(已 ffill,但備註欄保留原始)。"""
     name = file.name.lower()
     sheets: dict[str, pd.DataFrame] = {}
 
     if name.endswith(".csv"):
         df = pd.read_csv(file, header=None, dtype=str)
-        df = df.ffill(axis=0)
+        df = _ffill_with_exceptions(df)
         sheets["CSV"] = df
     else:
         xls = pd.ExcelFile(file, engine="openpyxl")
         for sheet_name in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet_name, header=None, dtype=str)
-            df = df.ffill(axis=0)
+            df = _ffill_with_exceptions(df)
             sheets[sheet_name] = df
 
     return sheets
@@ -475,10 +496,12 @@ TEMPLATE_HEADER_CELLS = {
 # 模板資料區設定
 TEMPLATE_DATA_HEADER_ROW = 11   # 表頭第 11 行
 TEMPLATE_DATA_START_ROW = 12    # 資料從第 12 行起
-TEMPLATE_EXAMPLE_ROWS = 4       # 模板示範 4 行範例物料,要先清掉
+TEMPLATE_EXAMPLE_ROWS = 2       # 模板實際只有 row 12, 13 兩行範例物料(row 15 是合計列,不能動)
 
 # raw 欄名 → target 欄名 的映射
 # 兩邊欄名常見差異(全形空白、簡繁差異)做寬鬆比對
+# 注意:raw 的「单价」欄常被填垃圾字串「单价」,刻意排除 → 改用 cost_col 強制映射
+# 「金额」欄通常是 raw 公式算的結果,我們改用 target 的公式自動算 → 排除
 _RAW_TO_TARGET_MAP = {
     "款号": "款号",
     "品名": "品名",
@@ -494,10 +517,11 @@ _RAW_TO_TARGET_MAP = {
     "总订料数": "总订料数",
     "订料数量": "总订料数",
     "产前样数量": "产前样数量",
-    "单价": "单价",
-    "金额": "金额",
     "备注": "备注",
 }
+
+# 排除清單:這些 raw 欄名直接跳過,不寫入 target
+_RAW_SKIP_COLS = {"单价", "金额"}
 
 
 def _normalize_col_name(s):
@@ -551,8 +575,7 @@ def build_supplier_excel(
         if order_date:
             ws[TEMPLATE_HEADER_CELLS["date_cell"]] = order_date
 
-        # 2. 清掉模板裡的範例資料(只清值,保留樣式)
-        # 合併儲存格的非主格不能寫,要先判斷;公式格保留
+        # 2. 清掉模板範例物料區的值(只清 row 12, 13 — row 15 黃色合計列保留)
         for r in range(TEMPLATE_DATA_START_ROW, TEMPLATE_DATA_START_ROW + TEMPLATE_EXAMPLE_ROWS):
             for c in range(1, ws.max_column + 1):
                 cell = ws.cell(row=r, column=c)
@@ -561,6 +584,42 @@ def build_supplier_excel(
                 if isinstance(cell.value, str) and cell.value.startswith("="):
                     continue
                 cell.value = None
+
+        # 2.5 物料筆數超過模板範例(2 筆)時,要先 insert_rows 讓黃色合計列往下推
+        n_materials = len(style_df)
+        if n_materials > TEMPLATE_EXAMPLE_ROWS:
+            from copy import copy
+            extra = n_materials - TEMPLATE_EXAMPLE_ROWS
+            insert_at = TEMPLATE_DATA_START_ROW + TEMPLATE_EXAMPLE_ROWS  # row 14(會把 row 14, 15, 16+ 推下去)
+            ws.insert_rows(idx=insert_at, amount=extra)
+
+            # insert_rows 不會自動複製樣式 → 手動從 row 13(最後一個範例)複製樣式 + 公式到新行
+            template_row = TEMPLATE_DATA_START_ROW + 1  # row 13
+            for offset in range(extra):
+                new_row = insert_at + offset  # row 14, 15, ...
+                for c in range(1, ws.max_column + 1):
+                    src = ws.cell(row=template_row, column=c)
+                    dst = ws.cell(row=new_row, column=c)
+                    if isinstance(dst, MergedCell):
+                        continue
+                    # 複製樣式(用 copy 避免共享物件)
+                    if src.has_style:
+                        dst.font = copy(src.font)
+                        dst.fill = copy(src.fill)
+                        dst.border = copy(src.border)
+                        dst.alignment = copy(src.alignment)
+                        dst.number_format = src.number_format
+                    # 複製公式並把 row 號替換成新 row 號
+                    if isinstance(src.value, str) and src.value.startswith("="):
+                        old_ref = str(template_row)
+                        new_ref = str(new_row)
+                        # 用 regex 替換獨立出現的 row 號(避免誤替換 130 中的 13)
+                        new_formula = re.sub(
+                            rf"(?<![0-9]){old_ref}(?![0-9])",
+                            new_ref,
+                            src.value,
+                        )
+                        dst.value = new_formula
 
         # 3. 從 target 第 11 行讀出表頭欄名 → 對應 column index
         target_headers = {}  # {欄名: column_idx}
@@ -573,6 +632,9 @@ def build_supplier_excel(
         col_mapping = {}  # {raw_col_name: target_col_idx}
         for raw_col in style_df.columns:
             raw_norm = _normalize_col_name(raw_col)
+            # 跳過排除清單(单价/金额 — 改用 cost_col 與公式)
+            if raw_norm in _RAW_SKIP_COLS:
+                continue
             # 直接同名匹配
             if raw_norm in target_headers:
                 col_mapping[raw_col] = target_headers[raw_norm]
@@ -584,10 +646,9 @@ def build_supplier_excel(
                     if target_norm in target_headers:
                         col_mapping[raw_col] = target_headers[target_norm]
                         break
-            # 額外:cost_col 強制映射到「单价」
-            if cost_col and raw_col == cost_col:
-                if "单价" in target_headers:
-                    col_mapping[raw_col] = target_headers["单价"]
+        # cost_col 強制映射到 target 的「单价」(放在最後,優先級最高)
+        if cost_col and "单价" in target_headers:
+            col_mapping[cost_col] = target_headers["单价"]
 
         # 5. 填入物料資料(從 row 12 起)
         notes_text = "\n".join(sheet_notes) if sheet_notes else ""
