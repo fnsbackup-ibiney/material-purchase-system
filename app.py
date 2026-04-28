@@ -589,31 +589,50 @@ def build_supplier_excel(
         n_materials = len(style_df)
         if n_materials > TEMPLATE_EXAMPLE_ROWS:
             from copy import copy
+            from openpyxl.utils import get_column_letter
+
             extra = n_materials - TEMPLATE_EXAMPLE_ROWS
-            insert_at = TEMPLATE_DATA_START_ROW + TEMPLATE_EXAMPLE_ROWS  # row 14(會把 row 14, 15, 16+ 推下去)
+            insert_at = TEMPLATE_DATA_START_ROW + TEMPLATE_EXAMPLE_ROWS  # row 14
+
+            # ── insert_rows 前先抓出所有「會被推下去」的合併儲存格,事後手動修正 ──
+            # openpyxl insert_rows 不會自動更新合併範圍,必須自己重設
+            merges_to_shift = []
+            for merge in list(ws.merged_cells.ranges):
+                if merge.min_row >= insert_at:
+                    merges_to_shift.append((
+                        merge.min_row, merge.max_row,
+                        merge.min_col, merge.max_col,
+                    ))
+                    ws.unmerge_cells(str(merge))
+
             ws.insert_rows(idx=insert_at, amount=extra)
 
-            # insert_rows 不會自動複製樣式 → 手動從 row 13(最後一個範例)複製樣式 + 公式到新行
+            # 重新建立合併範圍(每個範圍都往下推 extra 行)
+            for min_r, max_r, min_c, max_c in merges_to_shift:
+                new_range = (
+                    f"{get_column_letter(min_c)}{min_r + extra}:"
+                    f"{get_column_letter(max_c)}{max_r + extra}"
+                )
+                ws.merge_cells(new_range)
+
+            # 手動從 row 13(最後一個範例)複製樣式 + 公式到新插入的行
             template_row = TEMPLATE_DATA_START_ROW + 1  # row 13
             for offset in range(extra):
-                new_row = insert_at + offset  # row 14, 15, ...
+                new_row = insert_at + offset
                 for c in range(1, ws.max_column + 1):
                     src = ws.cell(row=template_row, column=c)
                     dst = ws.cell(row=new_row, column=c)
                     if isinstance(dst, MergedCell):
                         continue
-                    # 複製樣式(用 copy 避免共享物件)
                     if src.has_style:
                         dst.font = copy(src.font)
                         dst.fill = copy(src.fill)
                         dst.border = copy(src.border)
                         dst.alignment = copy(src.alignment)
                         dst.number_format = src.number_format
-                    # 複製公式並把 row 號替換成新 row 號
                     if isinstance(src.value, str) and src.value.startswith("="):
                         old_ref = str(template_row)
                         new_ref = str(new_row)
-                        # 用 regex 替換獨立出現的 row 號(避免誤替換 130 中的 13)
                         new_formula = re.sub(
                             rf"(?<![0-9]){old_ref}(?![0-9])",
                             new_ref,
@@ -651,7 +670,8 @@ def build_supplier_excel(
             col_mapping[cost_col] = target_headers["单价"]
 
         # 5. 填入物料資料(從 row 12 起)
-        notes_text = "\n".join(sheet_notes) if sheet_notes else ""
+        # 「备注」欄只放 raw 該物料自己的備註(由 col_mapping 自動帶),不再塞 sheet 級備註
+        # sheet 級備註(出口规定、1./2./3. 條款)保留在 target 模板的固定位置(row 16-19)
         for i, (_, row) in enumerate(style_df.iterrows()):
             target_row = TEMPLATE_DATA_START_ROW + i
             for raw_col, target_col_idx in col_mapping.items():
@@ -663,14 +683,6 @@ def build_supplier_excel(
                     if isinstance(cell.value, str) and cell.value.startswith("="):
                         continue
                     cell.value = val
-            # 把 sheet 級備註附加到「备注」欄(不覆蓋原 raw 備註)
-            if notes_text and "备注" in target_headers:
-                memo_col = target_headers["备注"]
-                cell = ws.cell(row=target_row, column=memo_col)
-                if not isinstance(cell, MergedCell):
-                    existing = str(cell.value or "").strip()
-                    appended = f"{existing}\n{notes_text}" if existing else notes_text
-                    cell.value = appended
 
     # 存成 bytes
     out = io.BytesIO()
@@ -1021,9 +1033,9 @@ if export_collector:
     elif st.session_state.std_library is None:
         st.info("💡 提示:左側 sidebar 上傳標準材料庫即可啟用紅燈警告。目前未上傳,直接匯出。")
 
-    # 匯出按鈕
+    # 產生按鈕(產生完把 bytes 暫存到 session_state,讓多個下載按鈕共用)
     if st.button(
-        "🚀 產生 ZIP 並下載",
+        "🚀 產生匯出檔案",
         type="primary",
         disabled=not can_export,
         use_container_width=True,
@@ -1040,24 +1052,50 @@ if export_collector:
                         cost_col=info["cost_col"],
                         template_bytes=template_bytes,
                     )
-                    # 檔名清理:移除非法字元
                     safe_name = re.sub(r'[\\/:*?"<>|]', "_", sup_name)
                     supplier_files[f"採購單_{safe_name}.xlsx"] = excel_bytes
-                # 打包 ZIP
                 zip_bytes = build_zip_from_supplier_files(supplier_files)
-            # 提供下載
-            st.success(f"✅ 已產生 {len(supplier_files)} 份檔案,請點下方下載")
-            st.download_button(
-                label="📥 下載 ZIP",
-                data=zip_bytes,
-                file_name="採購單匯出.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
+            # 暫存到 session_state(讓重整不會消失)
+            st.session_state["export_files"] = supplier_files
+            st.session_state["export_zip"] = zip_bytes
+            st.success(f"✅ 已產生 {len(supplier_files)} 份檔案,請選擇下載方式")
         except Exception as e:
             st.error(f"❌ 產生失敗:{e}")
             import traceback
             st.code(traceback.format_exc())
+
+    # 顯示下載按鈕(產生過後一直留著)
+    if st.session_state.get("export_files"):
+        files = st.session_state["export_files"]
+        zip_bytes = st.session_state["export_zip"]
+
+        st.markdown("---")
+        st.markdown("#### 📥 下載選項")
+
+        # 整包 ZIP
+        st.download_button(
+            label=f"📦 下載全部({len(files)} 個檔)— ZIP 打包",
+            data=zip_bytes,
+            file_name="採購單匯出.zip",
+            mime="application/zip",
+            use_container_width=True,
+            type="primary",
+        )
+
+        # 個別下載
+        st.markdown("**或單獨下載某一個供應商檔:**")
+        # 排成兩欄,讓畫面比較不那麼擠
+        cols = st.columns(2)
+        for i, (fname, fbytes) in enumerate(files.items()):
+            with cols[i % 2]:
+                st.download_button(
+                    label=f"📄 {fname}",
+                    data=fbytes,
+                    file_name=fname,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"single_dl_{fname}",
+                    use_container_width=True,
+                )
 
 
 # ── 主流程結束,最後渲染 sidebar(此時所有函式都已定義完成)──────
