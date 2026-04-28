@@ -456,6 +456,186 @@ def _match_one(query: str, library: dict, size_query: str) -> str:
 _RANK = {"🟢": 0, "🟡": 1, "🚨": 2, "⚪": 3}
 
 
+# ── Step 5:模板填值匯出 ZIP ──────────────────────────────
+
+# 公司抬頭(已固定為嘉善凯翔)— Step 5 採用此名稱
+COMPANY_NAME = "嘉善凯翔服饰有限公司"
+
+# target_format 模板路徑(放在 repo 內,部署時隨程式上雲)
+TEMPLATE_PATH = "templates/target_format.xlsx"
+TEMPLATE_SHEET = "辅料"  # 模板 sheet 名
+
+# 模板抬頭區關鍵 cell:程式會把這幾格的值替換掉
+TEMPLATE_HEADER_CELLS = {
+    "supplier_cell": "C6",        # 供應商
+    "date_cell": "K5",            # 訂料日期
+    # 收貨人/電話/交貨期/交貨地點 raw 通常沒有,留空繼承
+}
+
+# 模板資料區設定
+TEMPLATE_DATA_HEADER_ROW = 11   # 表頭第 11 行
+TEMPLATE_DATA_START_ROW = 12    # 資料從第 12 行起
+TEMPLATE_EXAMPLE_ROWS = 4       # 模板示範 4 行範例物料,要先清掉
+
+# raw 欄名 → target 欄名 的映射
+# 兩邊欄名常見差異(全形空白、簡繁差異)做寬鬆比對
+_RAW_TO_TARGET_MAP = {
+    "款号": "款号",
+    "品名": "品名",
+    "客户编号": "客户编号",
+    "颜色": "颜色",
+    "成品数": "成品数",
+    "规格": "规格cm",
+    "规格cm": "规格cm",
+    "尺码": "规格cm",
+    "尺寸": "规格cm",
+    "单耗": "单耗",
+    "单位": "单位",
+    "总订料数": "总订料数",
+    "订料数量": "总订料数",
+    "产前样数量": "产前样数量",
+    "单价": "单价",
+    "金额": "金额",
+    "备注": "备注",
+}
+
+
+def _normalize_col_name(s):
+    """把欄名正規化:去空白、繁簡統一(粗略,只去常見全形空白)"""
+    if s is None:
+        return ""
+    return re.sub(r"\s+", "", str(s)).strip()
+
+
+def build_supplier_excel(
+    supplier_name: str,
+    styles_dict: dict,
+    sheet_notes: list,
+    cost_col: str | None,
+    template_bytes: bytes,
+    order_date: str = "",
+) -> bytes:
+    """
+    為單一供應商產生一份 Excel 檔(每個款號一張 sheet)。
+
+    參數:
+      supplier_name : 供應商名稱(會填到 C6)
+      styles_dict   : { 款號: 物料 DataFrame }
+      sheet_notes   : 該 sheet 的備註(填到每個物料的「备注」欄末尾)
+      cost_col      : raw 中的成本價欄名(會映射到 target 的「单价」)
+      template_bytes: target_format.xlsx 的二進位
+      order_date    : 訂料日期字串
+
+    回傳:
+      bytes:Excel 檔的二進位
+    """
+    import openpyxl
+    from openpyxl.cell.cell import MergedCell
+
+    wb = openpyxl.load_workbook(io.BytesIO(template_bytes))
+    template_ws = wb[TEMPLATE_SHEET]
+
+    # 對每個款號:複製模板 sheet 並重新命名
+    first = True
+    for style_code, style_df in styles_dict.items():
+        if first:
+            ws = template_ws
+            ws.title = str(style_code)[:30]  # Excel sheet 名上限 31 字
+            first = False
+        else:
+            ws = wb.copy_worksheet(template_ws)
+            ws.title = str(style_code)[:30]
+
+        # 1. 替換抬頭區
+        ws[TEMPLATE_HEADER_CELLS["supplier_cell"]] = supplier_name
+        if order_date:
+            ws[TEMPLATE_HEADER_CELLS["date_cell"]] = order_date
+
+        # 2. 清掉模板裡的範例資料(只清值,保留樣式)
+        # 合併儲存格的非主格不能寫,要先判斷;公式格保留
+        for r in range(TEMPLATE_DATA_START_ROW, TEMPLATE_DATA_START_ROW + TEMPLATE_EXAMPLE_ROWS):
+            for c in range(1, ws.max_column + 1):
+                cell = ws.cell(row=r, column=c)
+                if isinstance(cell, MergedCell):
+                    continue
+                if isinstance(cell.value, str) and cell.value.startswith("="):
+                    continue
+                cell.value = None
+
+        # 3. 從 target 第 11 行讀出表頭欄名 → 對應 column index
+        target_headers = {}  # {欄名: column_idx}
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=TEMPLATE_DATA_HEADER_ROW, column=c).value
+            if v:
+                target_headers[_normalize_col_name(v)] = c
+
+        # 4. 建立 raw 欄名 → target column_idx 的映射
+        col_mapping = {}  # {raw_col_name: target_col_idx}
+        for raw_col in style_df.columns:
+            raw_norm = _normalize_col_name(raw_col)
+            # 直接同名匹配
+            if raw_norm in target_headers:
+                col_mapping[raw_col] = target_headers[raw_norm]
+                continue
+            # 走 mapping 表
+            for raw_key, target_key in _RAW_TO_TARGET_MAP.items():
+                if raw_key in raw_norm:
+                    target_norm = _normalize_col_name(target_key)
+                    if target_norm in target_headers:
+                        col_mapping[raw_col] = target_headers[target_norm]
+                        break
+            # 額外:cost_col 強制映射到「单价」
+            if cost_col and raw_col == cost_col:
+                if "单价" in target_headers:
+                    col_mapping[raw_col] = target_headers["单价"]
+
+        # 5. 填入物料資料(從 row 12 起)
+        notes_text = "\n".join(sheet_notes) if sheet_notes else ""
+        for i, (_, row) in enumerate(style_df.iterrows()):
+            target_row = TEMPLATE_DATA_START_ROW + i
+            for raw_col, target_col_idx in col_mapping.items():
+                val = row[raw_col]
+                if pd.notna(val) and str(val).strip():
+                    cell = ws.cell(row=target_row, column=target_col_idx)
+                    if isinstance(cell, MergedCell):
+                        continue
+                    if isinstance(cell.value, str) and cell.value.startswith("="):
+                        continue
+                    cell.value = val
+            # 把 sheet 級備註附加到「备注」欄(不覆蓋原 raw 備註)
+            if notes_text and "备注" in target_headers:
+                memo_col = target_headers["备注"]
+                cell = ws.cell(row=target_row, column=memo_col)
+                if not isinstance(cell, MergedCell):
+                    existing = str(cell.value or "").strip()
+                    appended = f"{existing}\n{notes_text}" if existing else notes_text
+                    cell.value = appended
+
+    # 存成 bytes
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def build_zip_from_supplier_files(files: dict) -> bytes:
+    """
+    files: { filename: bytes_content }
+    回傳:zip 檔的二進位
+    """
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname, content in files.items():
+            zf.writestr(fname, content)
+    return out.getvalue()
+
+
+@st.cache_data
+def load_template_bytes() -> bytes:
+    """讀取打包在 repo 中的 target_format.xlsx 模板"""
+    with open(TEMPLATE_PATH, "rb") as f:
+        return f.read()
+
+
 def compare_with_library(name, code, size, library: dict) -> str:
     """
     雙 key 比對:品名 OR 客戶編號 任一命中即算找到。
@@ -543,6 +723,12 @@ def split_by_supplier_and_style(data_df: pd.DataFrame, header_info: dict) -> dic
     return result
 
 
+# ── Step 5:匯出資料收集器 ──────────────────────────────
+# 結構:{供應商名: {"styles": {款號: df}, "notes": [...], "cost_col": str}}
+# 同一供應商跨多份檔/多 sheet 的款號會合併
+export_collector: dict = {}
+
+
 # ── 逐檔解析並展示 ────────────────────────────────────────
 for file in uploaded_files:
     st.divider()
@@ -625,6 +811,28 @@ for file in uploaded_files:
                 f"(已過濾 {len(sheet_notes)} 條備註)"
             )
 
+            # ── Step 5:把這份資料累積到 export_collector ──
+            for supplier, styles in split_result.items():
+                if supplier not in export_collector:
+                    export_collector[supplier] = {
+                        "styles": {},
+                        "notes": [],
+                        "cost_col": cost_col,
+                    }
+                # 同款號累積資料(若已存在則合併)
+                for style_code, sdf in styles.items():
+                    if style_code in export_collector[supplier]["styles"]:
+                        export_collector[supplier]["styles"][style_code] = pd.concat(
+                            [export_collector[supplier]["styles"][style_code], sdf],
+                            ignore_index=True,
+                        )
+                    else:
+                        export_collector[supplier]["styles"][style_code] = sdf.copy()
+                # 累積備註
+                for note in sheet_notes:
+                    if note not in export_collector[supplier]["notes"]:
+                        export_collector[supplier]["notes"].append(note)
+
             # 第一層 tabs:供應商
             supplier_tabs = st.tabs([f"🏭 {s}" for s in split_result.keys()])
             for stab, (supplier, styles) in zip(supplier_tabs, split_result.items()):
@@ -702,6 +910,93 @@ for file in uploaded_files:
                                 hide_index=True,
                                 height=220,
                             )
+
+
+# ── Step 5:匯出 ZIP 區塊 ──────────────────────────────
+if export_collector:
+    st.divider()
+    st.header("📦 匯出整理後的採購單")
+
+    n_suppliers_total = len(export_collector)
+    n_styles_total = sum(len(v["styles"]) for v in export_collector.values())
+    st.markdown(
+        f"準備匯出 **{n_suppliers_total}** 個供應商檔,共 **{n_styles_total}** 個款號 sheet"
+    )
+
+    # 顯示即將匯出的清單
+    with st.expander("👀 預覽即將匯出的檔案結構", expanded=False):
+        for sup, info in export_collector.items():
+            st.markdown(f"📄 **採購單_{sup}.xlsx**")
+            for style_code in info["styles"].keys():
+                n_mat = len(info["styles"][style_code])
+                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;📑 sheet:`{style_code}` ({n_mat} 筆物料)")
+
+    # 紅燈確認鎖(Step 4B 的承諾)
+    # 計算所有物料的紅燈總數
+    n_red_total = 0
+    for sup, info in export_collector.items():
+        for style_code, sdf in info["styles"].items():
+            name_c = next((c for c in sdf.columns if isinstance(c, str) and "品名" in c), None)
+            code_c = next((c for c in sdf.columns if isinstance(c, str) and ("客户编号" in c or "Article" in c)), None)
+            size_c = next((c for c in sdf.columns if isinstance(c, str) and ("规格" in c or "尺码" in c or "尺寸" in c)), None)
+            for _, row in sdf.iterrows():
+                nm = row.get(name_c) if name_c else None
+                cd = row.get(code_c) if code_c else None
+                sz = row.get(size_c) if size_c else None
+                if compare_with_library(nm, cd, sz, st.session_state.std_library) == "🚨":
+                    n_red_total += 1
+
+    # 紅燈確認
+    can_export = True
+    if n_red_total > 0:
+        st.warning(
+            f"⚠️ 偵測到 **{n_red_total} 筆紅燈物料**(標準庫找不到)\n\n"
+            "依公司規定,紅燈物料需要主管確認。請勾選下方確認框後才能匯出。"
+        )
+        can_export = st.checkbox(
+            f"✅ 我已確認這 {n_red_total} 筆紅燈物料皆已通過主管/相關人員審核",
+            key="red_light_confirmed",
+        )
+    elif st.session_state.std_library is None:
+        st.info("💡 提示:左側 sidebar 上傳標準材料庫即可啟用紅燈警告。目前未上傳,直接匯出。")
+
+    # 匯出按鈕
+    if st.button(
+        "🚀 產生 ZIP 並下載",
+        type="primary",
+        disabled=not can_export,
+        use_container_width=True,
+    ):
+        try:
+            with st.spinner("正在產生供應商 Excel 檔案..."):
+                template_bytes = load_template_bytes()
+                supplier_files = {}
+                for sup_name, info in export_collector.items():
+                    excel_bytes = build_supplier_excel(
+                        supplier_name=sup_name,
+                        styles_dict=info["styles"],
+                        sheet_notes=info["notes"],
+                        cost_col=info["cost_col"],
+                        template_bytes=template_bytes,
+                    )
+                    # 檔名清理:移除非法字元
+                    safe_name = re.sub(r'[\\/:*?"<>|]', "_", sup_name)
+                    supplier_files[f"採購單_{safe_name}.xlsx"] = excel_bytes
+                # 打包 ZIP
+                zip_bytes = build_zip_from_supplier_files(supplier_files)
+            # 提供下載
+            st.success(f"✅ 已產生 {len(supplier_files)} 份檔案,請點下方下載")
+            st.download_button(
+                label="📥 下載 ZIP",
+                data=zip_bytes,
+                file_name="採購單匯出.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.error(f"❌ 產生失敗:{e}")
+            import traceback
+            st.code(traceback.format_exc())
 
 
 # ── 主流程結束,最後渲染 sidebar(此時所有函式都已定義完成)──────
