@@ -750,6 +750,9 @@ def build_supplier_excel(
             for raw_col, target_col_idx in col_mapping.items():
                 val = row[raw_col]
                 if pd.notna(val) and str(val).strip():
+                    # 跳過 raw 占位符垃圾值(值剛好等於欄名,例如「单价」欄填「单价」字串)
+                    if str(val).strip() == str(raw_col).strip():
+                        continue
                     cell = ws.cell(row=target_row, column=target_col_idx)
                     if isinstance(cell, MergedCell):
                         continue
