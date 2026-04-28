@@ -611,8 +611,8 @@ def build_supplier_excel(
     wb = openpyxl.load_workbook(io.BytesIO(template_bytes))
     template_ws = wb[TEMPLATE_SHEET]
 
-    # 對每個款號:複製模板 sheet 並重新命名
-    first = True
+    # 對每個款號都從「乾淨的」template_ws 複製出新 sheet
+    # 千萬不能直接用 template_ws 改名(否則第二個款號會基於已被填值的 sheet 複製)
     for style_code, style_df in styles_dict.items():
         # ── 同款內「備註欄」自動繼承(ffill 限定該款 sub_df,不跨款)──
         # raw 同款多筆物料常只寫第一行備註,其他留空 → 程式視為「整款共用」
@@ -620,13 +620,9 @@ def build_supplier_excel(
         for col in style_df.columns:
             if isinstance(col, str) and ("备注" in col or "備註" in col):
                 style_df[col] = style_df[col].ffill()
-        if first:
-            ws = template_ws
-            ws.title = str(style_code)[:30]  # Excel sheet 名上限 31 字
-            first = False
-        else:
-            ws = wb.copy_worksheet(template_ws)
-            ws.title = str(style_code)[:30]
+
+        ws = wb.copy_worksheet(template_ws)
+        ws.title = str(style_code)[:30]  # Excel sheet 名上限 31 字
 
         # 1. 替換抬頭區
         # 供應商名(C6)— 用 split 後的個別供應商
@@ -791,6 +787,12 @@ def build_supplier_excel(
                         )
                         if new_formula != cell.value:
                             cell.value = new_formula
+
+    # 刪掉模板原本的 sheets(我們的 template_ws「辅料」+ 額外的「Sheet1」),只保留各款號 sheet
+    sheets_to_remove = [TEMPLATE_SHEET, "Sheet1"]
+    for sn in sheets_to_remove:
+        if sn in wb.sheetnames and len(wb.sheetnames) > 1:
+            del wb[sn]
 
     # 存成 bytes
     out = io.BytesIO()
