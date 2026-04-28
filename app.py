@@ -38,67 +38,69 @@ if "std_library_filename" not in st.session_state:
     st.session_state.std_library_filename = None
 
 
-# ── 左側 sidebar:本次上傳記錄 + 清空按鈕 ─────────────────
-with st.sidebar:
-    st.header("📜 本次上傳記錄")
+# ── 左側 sidebar 渲染函式(在主流程結尾處呼叫,避免函式未定義錯誤)───
+def render_sidebar():
+    with st.sidebar:
+        st.header("📜 本次上傳記錄")
 
-    if st.session_state.upload_history:
-        st.caption(f"共 {len(st.session_state.upload_history)} 筆(點擊下載原始檔)")
-        for i, fname in enumerate(st.session_state.upload_history, 1):
-            blob = st.session_state.uploaded_blobs.get(fname)
-            if blob is not None:
-                # 有暫存的二進位 → 提供下載按鈕
-                st.download_button(
-                    label=f"📥 {i}. {fname}",
-                    data=blob,
-                    file_name=fname,
-                    mime="application/octet-stream",
-                    key=f"dl_{i}_{fname}",
-                    use_container_width=True,
-                )
-            else:
-                # 沒暫存(理論上不會發生,留作保險)
-                st.markdown(f"`{i}.` {fname} _(內容已清)_")
-    else:
-        st.info("尚未上傳任何檔案")
+        if st.session_state.upload_history:
+            st.caption(f"共 {len(st.session_state.upload_history)} 筆(點擊下載原始檔)")
+            for i, fname in enumerate(st.session_state.upload_history, 1):
+                blob = st.session_state.uploaded_blobs.get(fname)
+                if blob is not None:
+                    st.download_button(
+                        label=f"📥 {i}. {fname}",
+                        data=blob,
+                        file_name=fname,
+                        mime="application/octet-stream",
+                        key=f"dl_{i}_{fname}",
+                        use_container_width=True,
+                    )
+                else:
+                    st.markdown(f"`{i}.` {fname} _(內容已清)_")
+        else:
+            st.info("尚未上傳任何檔案")
 
-    st.divider()
+        st.divider()
 
-    # ── Step 4A:標準材料庫上傳區 ────────────────
-    st.subheader("📚 標準材料庫")
-    if st.session_state.std_library:
-        st.success(f"✅ 已載入:{st.session_state.std_library_filename}")
-        n_names = len(st.session_state.std_library["name_set"])
-        st.caption(f"共 {n_names} 筆標準品名")
-        if st.button("🗑️ 移除標準庫", use_container_width=True):
-            st.session_state.std_library = None
-            st.session_state.std_library_filename = None
-            st.rerun()
-    else:
-        std_file = st.file_uploader(
-            "上傳標準材料庫(供比對用)",
-            type=["xlsx"],
-            accept_multiple_files=False,
-            help="不上傳也能用,但無法做紅燈警告",
-            key="std_lib_uploader",
-        )
-        if std_file is not None:
-            try:
-                with st.spinner("解析標準庫中..."):
-                    st.session_state.std_library = parse_standard_library(std_file.getvalue())
-                    st.session_state.std_library_filename = std_file.name
+        # ── Step 4A:標準材料庫上傳區 ────────────────
+        st.subheader("📚 標準材料庫")
+        if st.session_state.std_library:
+            st.success(f"✅ 已載入:{st.session_state.std_library_filename}")
+            n_names = len(st.session_state.std_library["name_set"])
+            st.caption(f"共 {n_names} 筆標準品名")
+            if st.button("🗑️ 移除標準庫", use_container_width=True):
+                st.session_state.std_library = None
+                st.session_state.std_library_filename = None
                 st.rerun()
-            except Exception as e:
-                st.error(f"❌ 無法解析:{e}")
+        else:
+            std_file = st.file_uploader(
+                "上傳標準材料庫(供比對用)",
+                type=["xlsx"],
+                accept_multiple_files=False,
+                help="不上傳也能用,但無法做紅燈警告",
+                key="std_lib_uploader",
+            )
+            if std_file is not None:
+                try:
+                    with st.spinner("解析標準庫中(12MB 約需 30 秒)..."):
+                        st.session_state.std_library = parse_standard_library(std_file.getvalue())
+                        st.session_state.std_library_filename = std_file.name
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 無法解析:{e}")
 
-    st.divider()
+        st.divider()
 
-    # 「清空」只清掉目前選著的檔案,讓你可以上傳下一批
-    # 上傳記錄(歷史檔名)會繼續累積,直到你關閉/重新整理瀏覽器
-    # 標準庫也保留,不被清空
-    if st.button("🔄 清空,重新開始", type="primary", use_container_width=True):
-        st.session_state.uploader_key += 1
-        st.rerun()
+        # 「清空」只清當前 file_uploader,記錄與標準庫都保留
+        if st.button("🔄 清空,重新開始", type="primary", use_container_width=True):
+            st.session_state.uploader_key += 1
+            st.rerun()
+
+
+# 注意:render_sidebar() 故意延後到主流程「最尾端」呼叫,
+# 因為 sidebar 內會用到 parse_standard_library() 等下方定義的函式。
+# Python 從上往下讀,函式呼叫前必須先看過函式定義。
 
 
 # ── 主畫面標題 ───────────────────────────────────────────
@@ -130,6 +132,7 @@ if uploaded_files:
 
 if not uploaded_files:
     st.info("👆 請從上方上傳一個或多個檔案")
+    render_sidebar()  # 主流程提早結束前先把 sidebar 畫出來
     st.stop()
 
 
@@ -699,3 +702,7 @@ for file in uploaded_files:
                                 hide_index=True,
                                 height=220,
                             )
+
+
+# ── 主流程結束,最後渲染 sidebar(此時所有函式都已定義完成)──────
+render_sidebar()
