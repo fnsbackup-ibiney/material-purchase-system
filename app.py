@@ -37,8 +37,9 @@ with st.sidebar:
 
     st.divider()
 
+    # 「清空」只清掉目前選著的檔案,讓你可以上傳下一批
+    # 上傳記錄(歷史檔名)會繼續累積,直到你關閉/重新整理瀏覽器
     if st.button("🔄 清空,重新開始", type="primary", use_container_width=True):
-        st.session_state.upload_history = []
         st.session_state.uploader_key += 1
         st.rerun()
 
@@ -58,10 +59,15 @@ uploaded_files = st.file_uploader(
 )
 
 # 累積上傳記錄(去重 by 檔名)
+# 若有新檔名加入,立刻 rerun 一次,讓 sidebar 看到最新記錄
 if uploaded_files:
-    for f in uploaded_files:
-        if f.name not in st.session_state.upload_history:
-            st.session_state.upload_history.append(f.name)
+    new_names = [
+        f.name for f in uploaded_files
+        if f.name not in st.session_state.upload_history
+    ]
+    if new_names:
+        st.session_state.upload_history.extend(new_names)
+        st.rerun()
 
 if not uploaded_files:
     st.info("👆 請從上方上傳一個或多個檔案")
@@ -110,7 +116,24 @@ def parse_sheet(df: pd.DataFrame, sheet_name: str) -> tuple[pd.DataFrame, dict]:
     if df.shape[0] <= HEADER_ROW:
         return pd.DataFrame(), {"default_supplier": None, "sheet_name": sheet_name}
 
-    headers = df.iloc[HEADER_ROW].tolist()
+    # 取第 10 行當欄名,並處理「空白欄名」「重複欄名」問題
+    # 否則 Streamlit 顯示表格會 ValueError(duplicate columns / NaN columns)
+    raw_headers = df.iloc[HEADER_ROW].tolist()
+    headers, seen = [], {}
+    for i, h in enumerate(raw_headers):
+        # NaN / 空白 → 用 _col_X 占位
+        if h is None or pd.isna(h) or not str(h).strip() or str(h).lower() == "nan":
+            name = f"_col_{i}"
+        else:
+            name = str(h).strip()
+        # 重複名 → 加序號
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}_{seen[name]}"
+        else:
+            seen[name] = 0
+        headers.append(name)
+
     data_df = df.iloc[HEADER_ROW + 1:].copy()
     data_df.columns = headers
     data_df = data_df.reset_index(drop=True)
