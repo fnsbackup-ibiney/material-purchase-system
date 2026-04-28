@@ -17,9 +17,12 @@ st.set_page_config(
 
 # ── Session state 初始化 ─────────────────────────────────
 # upload_history:累積這次 session 所有上傳過的檔名(關閉瀏覽器才清)
+# uploaded_blobs:對應的檔案二進位內容,讓 sidebar 可以提供下載
 # uploader_key:清空按鈕按下時 +1,藉換 key 讓 file_uploader 重置
 if "upload_history" not in st.session_state:
     st.session_state.upload_history = []
+if "uploaded_blobs" not in st.session_state:
+    st.session_state.uploaded_blobs = {}
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
@@ -29,9 +32,22 @@ with st.sidebar:
     st.header("📜 本次上傳記錄")
 
     if st.session_state.upload_history:
-        st.caption(f"共 {len(st.session_state.upload_history)} 筆")
+        st.caption(f"共 {len(st.session_state.upload_history)} 筆(點擊下載原始檔)")
         for i, fname in enumerate(st.session_state.upload_history, 1):
-            st.markdown(f"`{i}.` {fname}")
+            blob = st.session_state.uploaded_blobs.get(fname)
+            if blob is not None:
+                # 有暫存的二進位 → 提供下載按鈕
+                st.download_button(
+                    label=f"📥 {i}. {fname}",
+                    data=blob,
+                    file_name=fname,
+                    mime="application/octet-stream",
+                    key=f"dl_{i}_{fname}",
+                    use_container_width=True,
+                )
+            else:
+                # 沒暫存(理論上不會發生,留作保險)
+                st.markdown(f"`{i}.` {fname} _(內容已清)_")
     else:
         st.info("尚未上傳任何檔案")
 
@@ -58,13 +74,15 @@ uploaded_files = st.file_uploader(
     key=f"file_uploader_{st.session_state.uploader_key}",
 )
 
-# 累積上傳記錄(去重 by 檔名)
+# 累積上傳記錄 + 暫存原始檔位元組(讓 sidebar 可下載)
 # 若有新檔名加入,立刻 rerun 一次,讓 sidebar 看到最新記錄
 if uploaded_files:
-    new_names = [
-        f.name for f in uploaded_files
-        if f.name not in st.session_state.upload_history
-    ]
+    new_names = []
+    for f in uploaded_files:
+        if f.name not in st.session_state.upload_history:
+            new_names.append(f.name)
+            # getvalue() 取出位元組,存進 session(只活在當前瀏覽器分頁)
+            st.session_state.uploaded_blobs[f.name] = f.getvalue()
     if new_names:
         st.session_state.upload_history.extend(new_names)
         st.rerun()
